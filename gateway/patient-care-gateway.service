@@ -1,0 +1,29 @@
+# Patient Care gateway — Arduino serial <-> backend bridge, run on the Raspberry Pi.
+#
+# Install:
+#   sudo cp gateway/patient-care-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+# Enable + start ONLY AFTER you have pasted a DEVICE_TOKEN into gateway/.env
+# (the process exits immediately with code 2 if DEVICE_TOKEN is empty):
+#   sudo systemctl enable --now patient-care-gateway
+# Logs:
+#   journalctl -u patient-care-gateway -f
+
+[Unit]
+Description=Patient Care Gateway (Arduino serial <-> backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+# Grant access to /dev/ttyACM0 (owned by group dialout).
+SupplementaryGroups=dialout
+WorkingDirectory=/home/pi/Downloads/Patient-Care-main/gateway
+# config.py uses python-dotenv to read ./ .env from this WorkingDirectory.
+ExecStart=/home/pi/Downloads/Patient-Care-main/gateway/.venv/bin/python gateway.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

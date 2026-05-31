@@ -1,0 +1,71 @@
+# Patient Care — backend + Postgres.
+#
+# This is the file Dokploy's "Compose" application points at, and also what you
+# run directly with `docker compose up -d` to verify the stack on the Pi.
+#
+# IMPORTANT (from the plan's risk notes): run exactly ONE backend replica. The
+# WebSocket hub (app/ws_manager.py) is in-memory, so a second replica would split
+# live updates and gateway return-commands. Push (FCM) would still work, but the
+# in-app live feed / device commands would break. Fine for one Pi.
+#
+# The gateway (Arduino serial bridge) is intentionally NOT in this compose file —
+# USB serial passthrough into Docker is fragile, so it runs on the host via
+# systemd (see gateway/patient-care-gateway.service).
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-patient_care}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # Not published to the host — only the backend reaches it over the compose
+    # network at hostname `postgres`. Use `docker compose exec postgres psql` to
+    # inspect it.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${POSTGRES_DB:-patient_care}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Must use the asyncpg driver and the `postgres` service hostname.
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-patient_care}}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@patient.care}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?set BOOTSTRAP_ADMIN_PASSWORD in .env}
+      # Single-line Firebase service-account JSON. Empty = push disabled (the app
+      # still works; fan_out logs "FCM not configured" and returns 0).
+      FIREBASE_CREDS_JSON: ${FIREBASE_CREDS_JSON:-}
+    expose:
+      - "8000"
+    # In Dokploy: add a Domain on this `backend` service -> container port 8000,
+    # host ptcare.welocalhost.com, HTTPS on (Let's Encrypt). Traefik routes the
+    # domain to this exposed port over the Docker network, so NO host publish is
+    # needed (avoids clashing with other apps on your Dokploy server).
+    #
+    # For LOCAL testing only (docker compose up on a laptop), uncomment:
+    # ports:
+    #   - "8000:8000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').getcode()==200 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+volumes:
+  pgdata:

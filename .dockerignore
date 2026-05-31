@@ -1,0 +1,21 @@
+# Keep the build context small and the image clean. The web build stage needs
+# web/ SOURCE, so don't ignore web/ itself — only its generated/installed dirs.
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.venv/
+.venv/
+**/node_modules/
+web/dist/
+backend/web/
+app_flutter/
+tools/
+test.py
+*.log
+.env
+**/.env
+!.env.example
+*.md
+!README.md
