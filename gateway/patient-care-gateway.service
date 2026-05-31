@@ -13,6 +13,10 @@
 Description=Patient Care Gateway (Arduino serial <-> backend)
 After=network-online.target
 Wants=network-online.target
+# Never stop trying to (re)start on a cold boot: if the Arduino or the WiFi
+# isn't ready yet, the process may exit a few times in quick succession.
+# Disable systemd's start-rate limit so it keeps retrying forever.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -22,7 +26,9 @@ SupplementaryGroups=dialout
 WorkingDirectory=/home/pi/Downloads/Patient-Care-main/gateway
 # config.py uses python-dotenv to read ./ .env from this WorkingDirectory.
 ExecStart=/home/pi/Downloads/Patient-Care-main/gateway/.venv/bin/python gateway.py
-Restart=on-failure
+# always (not on-failure): recover from any exit — serial not ready, transient
+# crash, clean exit. The backend WS itself reconnects forever inside the process.
+Restart=always
 RestartSec=5
 
 [Install]
