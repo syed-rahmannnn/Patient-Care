@@ -27,6 +27,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("gateway")
 
 KNOWN_BUTTONS = {"WATER", "MEDICINE", "HELP", "BATHROOM"}
+
+# Event delivery retry/queue — so a button tap during a backend blip isn't lost.
+# Taps are enqueued (never blocking the serial reader) and a background worker
+# POSTs them, retrying with exponential backoff until the backend comes back.
+EVENT_QUEUE_MAX = 200       # plenty for human-paced taps; drops oldest-style log if full
+RETRY_BASE_DELAY = 1.0      # first retry after 1s
+RETRY_MAX_DELAY = 15.0      # cap backoff at 15s
+RETRY_MAX_ATTEMPTS = 20     # ~a few minutes of outage tolerance per event before giving up
 _LOCAL_SPEECH = {
     "WATER": "Patient needs water",
     "MEDICINE": "Patient needs medicine",
@@ -42,18 +50,47 @@ def _ws_url() -> str:
     return urlunparse((scheme, parsed.netloc, "/ws/gateway", "", f"token={cfg.device_token}", ""))
 
 
-async def report_event(client: httpx.AsyncClient, event_type: str) -> None:
+def enqueue_event(queue: "asyncio.Queue[str]", event_type: str) -> None:
+    """Hand a button event to the reporter worker. Never blocks the serial loop."""
     try:
-        r = await client.post(
-            "/api/v1/gateway/events",
-            headers={"Authorization": f"Bearer {cfg.device_token}"},
-            json={"type": event_type},
-            timeout=10,
-        )
-        r.raise_for_status()
-        log.info("reported %s → %s", event_type, r.json().get("id"))
-    except httpx.HTTPError as e:
-        log.error("failed to report %s: %s", event_type, e)
+        queue.put_nowait(event_type)
+        if queue.qsize() > 1:
+            log.info("queued %s (%d pending delivery)", event_type, queue.qsize())
+    except asyncio.QueueFull:
+        log.error("event queue full (%d) — dropping %s", EVENT_QUEUE_MAX, event_type)
+
+
+async def reporter_loop(client: httpx.AsyncClient, queue: "asyncio.Queue[str]") -> None:
+    """Drain queued events to the backend, retrying with backoff until delivered.
+
+    Runs as its own task so a backend outage never stalls the serial reader: taps
+    keep getting queued here and flush in order the moment the backend recovers.
+    """
+    while True:
+        event_type = await queue.get()
+        delay = RETRY_BASE_DELAY
+        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+            try:
+                r = await client.post(
+                    "/api/v1/gateway/events",
+                    headers={"Authorization": f"Bearer {cfg.device_token}"},
+                    json={"type": event_type},
+                    timeout=10,
+                )
+                r.raise_for_status()
+                log.info("reported %s → %s (attempt %d)", event_type, r.json().get("id"), attempt)
+                break
+            except httpx.HTTPError as e:
+                if attempt >= RETRY_MAX_ATTEMPTS:
+                    log.error("giving up on %s after %d attempts: %s", event_type, attempt, e)
+                    break
+                log.warning(
+                    "report %s failed (attempt %d/%d): %s — retrying in %.0fs",
+                    event_type, attempt, RETRY_MAX_ATTEMPTS, e, delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, RETRY_MAX_DELAY)
+        queue.task_done()
 
 
 def _write_serial(ser: serial.Serial, raw: str) -> None:
@@ -63,7 +100,7 @@ def _write_serial(ser: serial.Serial, raw: str) -> None:
         log.warning("serial write failed: %s", e)
 
 
-async def serial_loop(ser: serial.Serial, client: httpx.AsyncClient) -> None:
+async def serial_loop(ser: serial.Serial, queue: "asyncio.Queue[str]") -> None:
     buffer = ""
     while True:
         try:
@@ -77,7 +114,7 @@ async def serial_loop(ser: serial.Serial, client: httpx.AsyncClient) -> None:
                     log.info("[serial] %s", line)
                     if line in KNOWN_BUTTONS:
                         speak(_LOCAL_SPEECH[line])
-                        await report_event(client, line)
+                        enqueue_event(queue, line)
                     elif line == "SYSTEM_STARTED":
                         log.info("Arduino reports ready")
                 else:
@@ -150,7 +187,12 @@ async def main() -> int:
         except httpx.HTTPError as e:
             log.warning("backend not reachable yet: %s — will retry on first event", e)
 
-        await asyncio.gather(serial_loop(ser, client), ws_loop(ser))
+        queue: "asyncio.Queue[str]" = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
+        await asyncio.gather(
+            serial_loop(ser, queue),
+            reporter_loop(client, queue),
+            ws_loop(ser),
+        )
     return 0
 
 
